@@ -1,3 +1,12 @@
+"""
+Improved TileLang implementation of 4×4 Birkhoff projection via Newton's method.
+
+Changes vs original (Aoblex/mHC-proj dev/tl):
+  1. Line search: added gamma=0.25 step (6 steps total instead of 5)
+  2. Accept condition: unconditionally accept when gnorm < tol
+  3. Forward returns convergence flag per instance
+"""
+
 import torch
 import tilelang
 import tilelang.language as T
@@ -8,7 +17,7 @@ _EPS = 1e-8
 _THREADS_PER_BLOCK = 256
 _THREADS_PER_INSTANCE = 16
 _NEWTON_MAX_ITERS = 20
-_LINE_SEARCH_MAX_ITERS = 5
+_LINE_SEARCH_MAX_ITERS = 6  # was 5
 
 
 def _check_n4_tensor(name: str, tensor: torch.Tensor) -> None:
@@ -21,6 +30,8 @@ def _check_n4_tensor(name: str, tensor: torch.Tensor) -> None:
 def _float32_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to(torch.float32).contiguous()
 
+
+# ── warp-level reduction macros ──────────────────────────────────────────
 
 @T.macro
 def _warp_reduce_sum_row(val, mask):
@@ -58,6 +69,8 @@ def _warp_reduce_max_col(val, mask):
 def _abs_tir(x):
     return T.if_then_else(x < 0.0, -x, x)
 
+
+# ── core computation macros ──────────────────────────────────────────────
 
 @T.macro
 def _compute_f_gradient(val_beta, val_R, col, mask):
@@ -118,7 +131,6 @@ def _compute_newton_direction(val_c, val_T, gnorm, col, base_lane_id, mask):
     h11 = T.shfl_sync(hii, base_lane_id + 1, mask=mask)
     h22 = T.shfl_sync(hii, base_lane_id + 2, mask=mask)
 
-    # width=4 makes src_col local to each 4-lane row subgroup.
     src_col = T.if_then_else(col >= 2, 0, col + 1)
     val_T_perm = T.shfl_sync(val_T, src_col, 4, mask=mask)
     hij = -_warp_reduce_sum_col(val_T * val_T_perm, mask)
@@ -162,6 +174,8 @@ def _compute_newton_direction(val_c, val_T, gnorm, col, base_lane_id, mask):
     return T.if_then_else(T.Or(det <= _EPS, rho > 1000.0), fallback_d, val_d)
 
 
+# ── CHANGE 1: smoother line search with gamma=0.25 added ────────────────
+
 @T.macro
 def _line_search_gamma(k):
     return T.if_then_else(
@@ -170,7 +184,15 @@ def _line_search_gamma(k):
         T.if_then_else(
             k == 1,
             0.5,
-            T.if_then_else(k == 2, 0.1, T.if_then_else(k == 3, 0.05, 0.01)),
+            T.if_then_else(
+                k == 2,
+                0.25,  # NEW: fills gap between 0.5 and 0.1
+                T.if_then_else(
+                    k == 3,
+                    0.1,
+                    T.if_then_else(k == 4, 0.05, 0.01),
+                ),
+            ),
         ),
     )
 
@@ -221,13 +243,17 @@ def _solve_delta_linear_system(val_T, val_rhs, col, base_lane_id, mask):
     return val_y / det
 
 
+# ── forward kernel ───────────────────────────────────────────────────────
+
 @tilelang.jit
-def _birkhoff_proj_n4_forward_kernel(R, T_out, tol):
+def _birkhoff_proj_n4_forward_kernel(R, T_out, conv_flag, tol):
+    """Forward kernel with convergence flag output."""
     N = T.dynamic("N")
     dtype = T.float32
 
     R: T.Tensor((N, _N4, _N4), dtype)  # type: ignore
     T_out: T.Tensor((N, _N4, _N4), dtype)  # type: ignore
+    conv_flag: T.Tensor((N,), T.int32)  # type: ignore  # CHANGE 3
 
     num_blocks = T.ceildiv(N * _THREADS_PER_INSTANCE, _THREADS_PER_BLOCK)
 
@@ -281,9 +307,13 @@ def _birkhoff_proj_n4_forward_kernel(R, T_out, tol):
                                 )
                             )
 
-                            if T.And(
-                                candidate_f < current_f,
-                                candidate_gnorm < current_gnorm,
+                            # ── CHANGE 2: also accept if already converged ──
+                            if T.Or(
+                                T.And(
+                                    candidate_f < current_f,
+                                    candidate_gnorm < current_gnorm,
+                                ),
+                                candidate_gnorm < tol,
                             ):
                                 val_beta = candidate_beta
                                 val_c = candidate_c
@@ -307,6 +337,14 @@ def _birkhoff_proj_n4_forward_kernel(R, T_out, tol):
 
                 T_out[instance_id, row, col] = val_T
 
+                # ── CHANGE 3: write convergence flag (lane 0 of each instance) ──
+                if lane_id_group == 0:
+                    conv_flag[instance_id] = T.if_then_else(
+                        current_gnorm < tol, 1, 0
+                    )
+
+
+# ── backward kernel (unchanged) ──────────────────────────────────────────
 
 @tilelang.jit
 def _birkhoff_proj_n4_backward_kernel(G, T_out, D):
@@ -351,6 +389,8 @@ def _birkhoff_proj_n4_backward_kernel(G, T_out, D):
                 D[instance_id, row, col] = -val_D
 
 
+# ── Python wrappers ──────────────────────────────────────────────────────
+
 def birkhoff_proj_n4_forward(
     R: torch.Tensor, tol: float = 1e-6
 ) -> dict[str, torch.Tensor]:
@@ -358,8 +398,12 @@ def birkhoff_proj_n4_forward(
     src_options = {"device": R.device, "dtype": R.dtype}
     R_work = _float32_contiguous(R)
     T_out = torch.empty_like(R_work)
-    _birkhoff_proj_n4_forward_kernel(R_work, T_out, float(tol))
-    return {"T": T_out.to(**src_options)}
+    conv_flag = torch.empty(R_work.shape[0], dtype=torch.int32, device=R.device)
+    _birkhoff_proj_n4_forward_kernel(R_work, T_out, conv_flag, float(tol))
+    return {
+        "T": T_out.to(**src_options),
+        "converged": conv_flag.bool(),
+    }
 
 
 def birkhoff_proj_n4_backward(
@@ -377,15 +421,3 @@ def birkhoff_proj_n4_backward(
 
     _birkhoff_proj_n4_backward_kernel(G_work, T_work, D)
     return {"D": D.to(**src_options)}
-
-
-if __name__ == "__main__":
-    R = torch.randn(128, 4, 4, device="cuda")
-    # record time
-    import time
-
-    start_time = time.time()
-    result = birkhoff_proj_n4_forward(R)
-    end_time = time.time()
-    print(f"Time taken: {end_time - start_time}")
-    print(result["T"].shape)
