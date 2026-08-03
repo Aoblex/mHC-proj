@@ -112,12 +112,12 @@ def _tilelang_projection(n: int) -> Forward:
 BACKENDS = {
     backend.name: backend
     for backend in (
-        Backend("pytorch", _pytorch_sinkhorn),
-        Backend("triton", _triton_sinkhorn),
-        Backend("tilekernels", _tilekernels_sinkhorn),
-        Backend("tileexamples", _tileexamples_sinkhorn),
-        Backend("tilelang-projection", _tilelang_projection),
-        Backend("cuda-sinkhorn", _cuda_sinkhorn),
-        Backend("cuda-projection", _cuda_projection),
+        Backend("Vanilla", _pytorch_sinkhorn),
+        Backend("Triton-Sinkhorn", _triton_sinkhorn),
+        Backend("mHC.cu", _cuda_sinkhorn),
+        Backend("TileLangExamples", _tileexamples_sinkhorn),
+        Backend("TileKernels", _tilekernels_sinkhorn),
+        Backend("mHC-proj-TL", _tilelang_projection),
+        Backend("mHC-proj", _cuda_projection),
     )
 }

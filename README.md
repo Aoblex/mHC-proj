@@ -135,12 +135,16 @@ print(D3)
 
 ## Benchmark
 
-The benchmark compares four implementations for both $n=4$ and $n=8$:
+The benchmark uses the seven implementation names defined in the paper for both
+$n=4$ and $n=8$:
 
-1. **PyTorch**: A direct Sinkhorn–Knopp reference implementation.
-2. **Triton**: The fused Sinkhorn implementation adapted from [triton-sinkhorn](https://github.com/LottoLottoLotto/triton-sinkhorn).
-3. **CUDA Sinkhorn**: The specialized CUDA Sinkhorn implementation.
-4. **CUDA projection**: The second-order Birkhoff projection implemented by this library.
+1. **Vanilla**: A direct Sinkhorn–Knopp implementation in PyTorch.
+2. **Triton-Sinkhorn**: The fused implementation adapted from [triton-sinkhorn](https://github.com/LottoLottoLotto/triton-sinkhorn).
+3. **mHC.cu**: The specialized CUDA Sinkhorn–Knopp implementation.
+4. **TileLangExamples**: The Sinkhorn–Knopp implementation adapted from the TileLang examples.
+5. **TileKernels**: The Sinkhorn–Knopp implementation adapted from DeepSeek TileKernels.
+6. **mHC-proj-TL**: The proposed second-order projection solver implemented in TileLang.
+7. **mHC-proj**: The proposed second-order projection solver implemented in CUDA.
 
 Install the optional plotting dependency, run the benchmark, and render the plot with:
 

@@ -86,7 +86,7 @@ def run(args: argparse.Namespace) -> list[dict]:
                         )
                     times[name] = statistics.median(samples)
 
-                baseline = times["cuda-projection"]
+                baseline = times["mHC-proj"]
                 for name in args.backends:
                     mean_error, max_error = errors[name]
                     rows.append(
@@ -130,8 +130,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     args = parser.parse_args()
-    if "cuda-projection" not in args.backends:
-        parser.error("--backends must include cuda-projection")
+    if "mHC-proj" not in args.backends:
+        parser.error("--backends must include mHC-proj")
     return args
 
 

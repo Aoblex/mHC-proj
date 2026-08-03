@@ -24,12 +24,15 @@ def plot_results(rows: list[dict], output: Path) -> None:
     groups = defaultdict(list)
     for row in rows:
         groups[(row["n"], row["mode"], row["backend"])].append(row)
+    backends = list(dict.fromkeys(row["backend"] for row in rows))
 
     figure, axes = plt.subplots(2, 2, figsize=(12, 9), sharex=True)
     for row_index, n in enumerate((4, 8)):
         for column_index, mode in enumerate(("forward", "forward_backward")):
             axis = axes[row_index, column_index]
-            for backend in sorted({key[2] for key in groups if key[:2] == (n, mode)}):
+            for backend in backends:
+                if (n, mode, backend) not in groups:
+                    continue
                 values = sorted(
                     groups[(n, mode, backend)], key=lambda row: row["batch_size"]
                 )
