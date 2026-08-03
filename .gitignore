@@ -6,5 +6,4 @@ build/*
 .codex
 *.egg-info
 .vscode/
-uv.lock
 references/
