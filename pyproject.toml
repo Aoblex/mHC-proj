@@ -20,7 +20,9 @@ dev = [
     "pytest>=8.0",
 ]
 benchmark = [
+    "apache-tvm-ffi==0.1.11",
     "matplotlib>=3.10",
+    "tilelang==0.1.10",
 ]
 
 [project.urls]
