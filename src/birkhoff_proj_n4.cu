@@ -321,19 +321,10 @@ __device__ __forceinline__ float compute_newton_direction(
     float det = h00 * (h11 * h22 - h12 * h12) -
                 h01 * (h01 * h22 - h12 * h02) +
                 h02 * (h01 * h12 - h11 * h02);
-    // Let (lam1, lam2, lam3) be the three eigenvalues of H
-    // lam1 + lam2 + lam3 = h00 + h11 + h22
-    // lam1 * lam2 * lam3 = det
-    // Define m = (h00 + h11 + h22) / 3 to be the arithmetic mean
-    // det^(1/3) is the geometric mean
-    // Then rho = m^3 / det >= 1 measures how disperse the three eigenvalues of H are
-    // If rho is large, then the condition number of H may also be large
-    // In this case, we switch to gradient descent as a fallback method by setting d = -g
-    // Similarly, if det < EPSILON, then it means that the Newton direction may be very unstable,
-    // so we switch to gradient descent
-    const float m = (h00 + h11 + h22) / 3.0f;
-    const float rho = m * m * m / det;
-    if (det <= EPSILON || rho > 1000)
+    // A non-positive or tiny determinant makes the direct solve unstable, so
+    // use the gradient direction.  Other difficult directions remain guarded
+    // by the line search below.
+    if (det <= EPSILON)
     {
         return (col < 3) ? -val_g : 0.0f;
     }

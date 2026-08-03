@@ -11,27 +11,44 @@ namespace py = pybind11;
 
 py::dict birkhoff_proj_n4(
     torch::Tensor R,
-    float tol,
-    const py::kwargs& kwargs
+    float tol
 );
 
 py::dict birkhoff_proj_n4_backward(
     torch::Tensor G,
-    torch::Tensor T,
-    const py::kwargs& kwargs
+    torch::Tensor T
+);
+
+py::dict birkhoff_proj_n8(
+    torch::Tensor R,
+    float tol
+);
+
+py::dict birkhoff_proj_n8_backward(
+    torch::Tensor G,
+    torch::Tensor T
 );
 
 py::dict sinkhorn_knopp_n4(
     torch::Tensor M,
-    int max_iter,
-    const py::kwargs& kwargs
+    int max_iter
 );
 
 py::dict sinkhorn_knopp_n4_backward(
     torch::Tensor G,
     torch::Tensor M,
-    int max_iter,
-    const py::kwargs& kwargs
+    int max_iter
+);
+
+py::dict sinkhorn_knopp_n8(
+    torch::Tensor M,
+    int max_iter
+);
+
+py::dict sinkhorn_knopp_n8_backward(
+    torch::Tensor G,
+    torch::Tensor M,
+    int max_iter
 );
 #endif
 
@@ -50,11 +67,23 @@ PYBIND11_MODULE(_internal, m)
     m_torch.def("birkhoff_proj_n4_backward", &birkhoff_proj_n4_backward,
         py::arg("G"), py::arg("T"),
         "KL projection of 4x4 matrix to Birkhoff polytope, backward pass");
+    m_torch.def("birkhoff_proj_n8", &birkhoff_proj_n8,
+        py::arg("R"), py::arg("tol") = 1e-6,
+        "KL projection of 8x8 matrix to Birkhoff polytope");
+    m_torch.def("birkhoff_proj_n8_backward", &birkhoff_proj_n8_backward,
+        py::arg("G"), py::arg("T"),
+        "KL projection of 8x8 matrix to Birkhoff polytope, backward pass");
     m_torch.def("sinkhorn_knopp_n4", &sinkhorn_knopp_n4,
         py::arg("M"), py::arg("max_iter") = 20,
         "Sinkhorn-Knopp algorithm for 4x4 matrix");
     m_torch.def("sinkhorn_knopp_n4_backward", &sinkhorn_knopp_n4_backward,
         py::arg("G"), py::arg("M"), py::arg("max_iter") = 20,
         "Sinkhorn-Knopp algorithm for 4x4 matrix, backward pass");
+    m_torch.def("sinkhorn_knopp_n8", &sinkhorn_knopp_n8,
+        py::arg("M"), py::arg("max_iter") = 20,
+        "Sinkhorn-Knopp algorithm for 8x8 matrix");
+    m_torch.def("sinkhorn_knopp_n8_backward", &sinkhorn_knopp_n8_backward,
+        py::arg("G"), py::arg("M"), py::arg("max_iter") = 20,
+        "Sinkhorn-Knopp algorithm for 8x8 matrix, backward pass");
 #endif
 }

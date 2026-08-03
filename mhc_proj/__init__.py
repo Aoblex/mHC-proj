@@ -1,12 +1,17 @@
-# When the package is built using Pytorch, we typically
-# need to import torch first to properly load some libraries
-# such as libc10.so
-try:
-    import torch
-except:
-    pass
+"""PyTorch interface for the mHC CUDA extension."""
 
-from ._internal import *
-from .module import MHCProjectionN4, MHCSinkhornN4
+import torch as _torch  # noqa: F401  # Load PyTorch before the extension.
 
+from . import _internal
+from .module import MHCProjectionN4, MHCProjectionN8, MHCSinkhornN4, MHCSinkhornN8
+
+torch = _internal.torch
 __version__ = "0.1.0"
+
+__all__ = [
+    "MHCProjectionN4",
+    "MHCProjectionN8",
+    "MHCSinkhornN4",
+    "MHCSinkhornN8",
+    "torch",
+]
