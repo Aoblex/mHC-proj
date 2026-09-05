@@ -1,17 +1,22 @@
 UV ?= uv
 ARGS ?=
+SYNC = $(UV) sync --frozen --no-install-project
+INSTALL_PROJECT = $(UV) pip install --no-build-isolation --no-deps --reinstall-package mhc-proj --editable .
 
 .PHONY: build test benchmark plot
 
 build:
-	$(UV) sync --reinstall-package mhc-proj
+	$(SYNC)
+	$(INSTALL_PROJECT)
 
 test: build
 	$(UV) run --no-sync pytest
 
 benchmark:
-	$(UV) sync --group benchmark --reinstall-package mhc-proj
+	$(SYNC) --group benchmark
+	$(INSTALL_PROJECT)
 	$(UV) run --no-sync python benchmark/run.py $(ARGS)
 
 plot:
-	$(UV) run --group benchmark python benchmark/plot.py $(ARGS)
+	$(SYNC) --group benchmark
+	$(UV) run --no-sync python benchmark/plot.py $(ARGS)
