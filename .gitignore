@@ -4,6 +4,7 @@ build/*
 *.pyc
 
 .codex
+.agents/runs/
 *.egg-info
 .vscode/
 references/
