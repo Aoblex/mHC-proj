@@ -4,7 +4,9 @@ build/*
 *.pyc
 
 .codex
+.agents/runs/
 *.egg-info
 .vscode/
-uv.lock
 references/
+
+.DS_Store
