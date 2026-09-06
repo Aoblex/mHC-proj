@@ -8,13 +8,21 @@ authors = [
 maintainers = [
     {name = "Yixuan Qiu", email = "yixuanq@gmail.com"},
 ]
-license = {text = "MIT"}
+license = "MIT"
 readme = "README.md"
 requires-python = ">= 3.12"
 dependencies = [
-    "pandas>=3.0.2",
-    "tilelang>=0.1.9",
-    "torch >= 2.8.0",
+    "torch>=2.8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+benchmark = [
+    "apache-tvm-ffi==0.1.11",
+    "matplotlib>=3.10",
+    "tilelang==0.1.10",
 ]
 
 [project.urls]
@@ -28,3 +36,6 @@ build-backend = "setuptools.build_meta"
 [tool.cibuildwheel]
 # Only build on CPython
 build = "cp*"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
