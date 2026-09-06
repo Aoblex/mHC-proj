@@ -13,6 +13,9 @@ constexpr int BLOCK_DIM = 128;
 constexpr int WARPS_PER_BLOCK = BLOCK_DIM / 32;
 constexpr int NEWTON_MAX_ITERS = 20;
 constexpr int LINE_SEARCH_MAX_ITERS = 5;
+// Cholesky minimizes latency; packed LDL^T wins once the batch exposes enough
+// independent matrices to hide its serial dependency chain.
+constexpr int LDLT_MIN_BATCH_SIZE = 32768;
 constexpr float EPSILON = 1e-8f;
 constexpr unsigned int FULL_MASK = 0xffffffffu;
 
@@ -80,6 +83,33 @@ __device__ __forceinline__ void compute_f_objective(
     out_T1 = T1;
     out_objective =
         -warp_reduce_sum_col(alpha0, alpha1) - beta_sum;
+}
+
+// For a small step s, evaluate T' = T * exp(s) / row_sum(T * exp(s))
+// and delta_f = sum_i log(sum_j T_ij exp(s_j)) - sum_j s_j.
+// expm1/log1p avoid subtracting rounded absolute objectives near convergence.
+// Account for the FP32 row mass instead of assuming it is exactly one; the
+// column-only exponential is shared by both rows owned by each lane.
+__device__ __forceinline__ void compute_relative_candidate(
+    float T0,
+    float T1,
+    float step,
+    float step_sum,
+    float& out_T0,
+    float& out_T1,
+    float& out_delta
+)
+{
+    const float change = expm1f(step);
+    const float diff0 = warp_reduce_sum_row(T0 * change);
+    const float diff1 = warp_reduce_sum_row(T1 * change);
+    const float mass0 = warp_reduce_sum_row(T0);
+    const float mass1 = warp_reduce_sum_row(T1);
+    out_T0 = fmaf(T0, change, T0) / (mass0 + diff0);
+    out_T1 = fmaf(T1, change, T1) / (mass1 + diff1);
+    out_delta = warp_reduce_sum_col(
+        log1pf(diff0 / mass0), log1pf(diff1 / mass1)
+    ) - step_sum;
 }
 
 __device__ __forceinline__ float compute_gradient(
@@ -299,6 +329,123 @@ __device__ __forceinline__ bool cholesky_solve(
     return true;
 }
 
+// Lane 0 solves Hx=rhs using a packed, register-resident LDL^T factor.
+// L has an implicit unit diagonal and stores only its 21 strict-lower entries.
+// Returning false lets forward fall back to the gradient direction when a
+// finite-precision pivot is invalid.
+__device__ __forceinline__ bool ldlt_solve(
+    const float* H,
+    const float* rhs,
+    float* x
+)
+{
+    float L[REDUCED_SIZE * (REDUCED_SIZE - 1) / 2];
+    float D[REDUCED_SIZE];
+    float work[REDUCED_SIZE];
+
+    #pragma unroll
+    for (int k = 0; k < REDUCED_SIZE; ++k)
+    {
+        const int base_k = k * (k - 1) / 2;
+        float diagonal = H[k * REDUCED_SIZE + k];
+        #pragma unroll
+        for (int r = 0; r < k; ++r)
+        {
+            const float lkr = L[base_k + r];
+            diagonal -= lkr * lkr * D[r];
+        }
+        if (!(diagonal > EPSILON) || !isfinite(diagonal))
+        {
+            #pragma unroll
+            for (int i = 0; i < REDUCED_SIZE; ++i)
+            {
+                x[i] = rhs[i];
+            }
+            return false;
+        }
+        D[k] = diagonal;
+
+        #pragma unroll
+        for (int i = k + 1; i < REDUCED_SIZE; ++i)
+        {
+            const int base_i = i * (i - 1) / 2;
+            float value = H[i * REDUCED_SIZE + k];
+            #pragma unroll
+            for (int r = 0; r < k; ++r)
+            {
+                value -= L[base_i + r] * D[r] * L[base_k + r];
+            }
+            value /= diagonal;
+            if (!isfinite(value))
+            {
+                #pragma unroll
+                for (int j = 0; j < REDUCED_SIZE; ++j)
+                {
+                    x[j] = rhs[j];
+                }
+                return false;
+            }
+            L[base_i + k] = value;
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < REDUCED_SIZE; ++i)
+    {
+        const int base_i = i * (i - 1) / 2;
+        float value = rhs[i];
+        #pragma unroll
+        for (int j = 0; j < i; ++j)
+        {
+            value -= L[base_i + j] * work[j];
+        }
+        work[i] = value;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < REDUCED_SIZE; ++i)
+    {
+        work[i] /= D[i];
+    }
+
+    #pragma unroll
+    for (int i = REDUCED_SIZE - 1; i >= 0; --i)
+    {
+        float value = work[i];
+        #pragma unroll
+        for (int j = i + 1; j < REDUCED_SIZE; ++j)
+        {
+            value -= L[j * (j - 1) / 2 + i] * work[j];
+        }
+        work[i] = value;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < REDUCED_SIZE; ++i)
+    {
+        x[i] = work[i];
+    }
+    return true;
+}
+
+template<bool USE_LDLT>
+__device__ __forceinline__ void solve_linear_system(
+    float* H,
+    const float* rhs,
+    float* x
+)
+{
+    if constexpr (USE_LDLT)
+    {
+        ldlt_solve(H, rhs, x);
+    }
+    else
+    {
+        cholesky_solve(H, rhs, x);
+    }
+}
+
+template<bool USE_LDLT>
 __global__ void birkhoff_proj_n8_kernel(
     const float* __restrict__ R,
     float* __restrict__ T,
@@ -379,7 +526,7 @@ __global__ void birkhoff_proj_n8_kernel(
 
             if (lane_id == 0)
             {
-                cholesky_solve(
+                solve_linear_system<USE_LDLT>(
                     shared_H[warp_id],
                     shared_rhs[warp_id],
                     shared_x[warp_id]
@@ -392,6 +539,7 @@ __global__ void birkhoff_proj_n8_kernel(
                     ? shared_x[warp_id][col]
                     : 0.0f;
             const float direction_sum = warp_reduce_sum_row(direction);
+            const float direction_max = warp_reduce_max_row(fabsf(direction));
             bool accepted = false;
 
             #pragma unroll 1
@@ -404,18 +552,32 @@ __global__ void birkhoff_proj_n8_kernel(
                 float candidate_c;
                 float candidate_T0;
                 float candidate_T1;
-                float candidate_objective;
-                compute_f_objective(
-                    candidate_beta,
-                    candidate_beta_sum,
-                    R0,
-                    R1,
-                    candidate_T0,
-                    candidate_T1,
-                    candidate_objective
-                );
+                float objective_delta;
+                // Keep the multiplicative update close to one. Large steps
+                // use logits so entries lost to underflow can be recovered.
+                if (gamma_list[k] * direction_max < 0.5f)
+                {
+                    compute_relative_candidate(
+                        T0,
+                        T1,
+                        gamma_list[k] * direction,
+                        gamma_list[k] * direction_sum,
+                        candidate_T0,
+                        candidate_T1,
+                        objective_delta
+                    );
+                }
+                else
+                {
+                    float candidate_objective;
+                    compute_f_objective(
+                        candidate_beta, candidate_beta_sum, R0, R1,
+                        candidate_T0, candidate_T1, candidate_objective
+                    );
+                    objective_delta = candidate_objective - objective;
+                }
 
-                if (!(candidate_objective < objective))
+                if (!(objective_delta < 0.0f))
                 {
                     continue;
                 }
@@ -433,7 +595,7 @@ __global__ void birkhoff_proj_n8_kernel(
                 c = candidate_c;
                 T0 = candidate_T0;
                 T1 = candidate_T1;
-                objective = candidate_objective;
+                objective += objective_delta;
                 gnorm = candidate_gnorm;
                 accepted = true;
                 break;
@@ -553,12 +715,24 @@ void birkhoff_proj_n8(
     const int num_blocks =
         (batch_size + birkhoff_n8::WARPS_PER_BLOCK - 1) /
         birkhoff_n8::WARPS_PER_BLOCK;
-    birkhoff_n8::birkhoff_proj_n8_kernel<<<
-        num_blocks,
-        birkhoff_n8::BLOCK_DIM,
-        0,
-        stream
-    >>>(R, T, tol, batch_size);
+    if (batch_size >= birkhoff_n8::LDLT_MIN_BATCH_SIZE)
+    {
+        birkhoff_n8::birkhoff_proj_n8_kernel<true><<<
+            num_blocks,
+            birkhoff_n8::BLOCK_DIM,
+            0,
+            stream
+        >>>(R, T, tol, batch_size);
+    }
+    else
+    {
+        birkhoff_n8::birkhoff_proj_n8_kernel<false><<<
+            num_blocks,
+            birkhoff_n8::BLOCK_DIM,
+            0,
+            stream
+        >>>(R, T, tol, batch_size);
+    }
 }
 
 void birkhoff_proj_n8_backward(

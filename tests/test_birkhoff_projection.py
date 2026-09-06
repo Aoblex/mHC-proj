@@ -77,6 +77,64 @@ def test_projection_forward_backward(
     _check_forward_backward(module_type(tol=1e-6), n)
 
 
+@pytest.mark.parametrize("batch_size", [128, 32768])
+def test_n8_projection_matches_float64_reference(batch_size: int) -> None:
+    """Exercise both forward schedules and the small-step convergence path."""
+    torch.manual_seed(2026)
+    logits = torch.randn(batch_size, 8, 8, device="cuda", requires_grad=True)
+    upstream = torch.randn_like(logits)
+
+    # Independent FP64 Sinkhorn reference on well-conditioned random inputs.
+    target = logits.detach().double().exp()
+    for _ in range(100):
+        target = target / target.sum(dim=-1, keepdim=True)
+        target = target / target.sum(dim=-2, keepdim=True)
+    torch.testing.assert_close(
+        target.sum(dim=-1), torch.ones_like(target[:, :, 0]), rtol=0, atol=1e-12
+    )
+    weighted = upstream.double() * target
+    row_rhs = weighted.sum(dim=-1)
+    rhs = weighted.sum(dim=-2) - (
+        target.transpose(-1, -2) @ row_rhs.unsqueeze(-1)
+    ).squeeze(-1)
+    reduced = target[:, :, :7]
+    hessian = torch.eye(7, dtype=torch.float64, device="cuda") - (
+        reduced.transpose(-1, -2) @ reduced
+    )
+    column_dual = torch.linalg.solve(hessian, rhs[:, :7])
+    column_dual = torch.cat((column_dual, torch.zeros_like(rhs[:, :1])), dim=-1)
+    row_dual = row_rhs - (target @ column_dual.unsqueeze(-1)).squeeze(-1)
+    expected_gradient = (
+        upstream.double() - row_dual.unsqueeze(-1) - column_dual.unsqueeze(-2)
+    ) * target
+
+    output = mhc_proj.MHCProjectionN8(tol=1e-6)(logits)
+    gradient = torch.autograd.grad(output, logits, upstream)[0]
+    torch.testing.assert_close(output.double(), target, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(
+        gradient.double(), expected_gradient, rtol=1e-5, atol=2e-6
+    )
+    error = (output.double().sum(dim=-1) - 1).abs().sum(dim=-1) + (
+        output.double().sum(dim=-2) - 1
+    ).abs().sum(dim=-1)
+    assert error.max() < 3e-6
+
+
+@pytest.mark.parametrize("batch_size", [2048, 32768])
+def test_n8_small_step_convergence_on_difficult_inputs(batch_size: int) -> None:
+    """Small valid steps must not be lost to absolute-objective rounding."""
+    torch.manual_seed(321 + batch_size)
+    logits = 10 * torch.randn(batch_size, 8, 8, device="cuda")
+    output = mhc_proj.MHCProjectionN8(tol=1e-6)(logits)
+    assert torch.isfinite(output).all()
+    error = (output.double().sum(dim=-1) - 1).abs().sum(dim=-1) + (
+        output.double().sum(dim=-2) - 1
+    ).abs().sum(dim=-1)
+    assert error.mean() < 2e-6
+    assert error.quantile(0.99) < 5e-6
+    assert error.max() < 5e-4
+
+
 @pytest.mark.parametrize(("n", "module_type"), SINKHORN_MODULES)
 def test_sinkhorn_forward_backward(n: int, module_type: type[torch.nn.Module]) -> None:
     _check_forward_backward(module_type(max_iter=20), n)
@@ -166,7 +224,7 @@ def test_solver_uses_current_stream(
     ("n", "batch_size", "forward"),
     [
         pytest.param(4, 4096, mhc_proj.torch.birkhoff_proj_n4, id="n4"),
-        pytest.param(8, 2048, mhc_proj.torch.birkhoff_proj_n8, id="n8"),
+        pytest.param(8, 32768, mhc_proj.torch.birkhoff_proj_n8, id="n8"),
     ],
 )
 def test_projection_converges_on_difficult_inputs(
