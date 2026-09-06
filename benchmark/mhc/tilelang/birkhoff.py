@@ -1,7 +1,8 @@
-import torch
+import math
+
 import tilelang
 import tilelang.language as T
-
+import torch
 
 _N4 = 4
 _EPS = 1e-8
@@ -14,6 +15,8 @@ _LINE_SEARCH_MAX_ITERS = 5
 def _check_n4_tensor(name: str, tensor: torch.Tensor) -> None:
     if tensor.ndim != 3 or tensor.shape[-2:] != (_N4, _N4):
         raise ValueError(f"{name} must be a tensor of size B x 4 x 4")
+    if not tensor.is_floating_point():
+        raise TypeError(f"{name} must be a floating-point tensor")
     if not tensor.is_cuda:
         raise ValueError(f"{name} must be a CUDA tensor")
 
@@ -136,9 +139,6 @@ def _compute_newton_direction(val_c, val_T, gnorm, col, base_lane_id, mask):
         - h01 * (h01 * h22 - h12 * h02)
         + h02 * (h01 * h12 - h11 * h02)
     )
-    mean_diag = (h00 + h11 + h22) / 3.0
-    rho = mean_diag * mean_diag * mean_diag / det
-
     y0 = (
         (h11 * h22 - h12 * h12) * g0
         + (h02 * h12 - h01 * h22) * g1
@@ -157,9 +157,9 @@ def _compute_newton_direction(val_c, val_T, gnorm, col, base_lane_id, mask):
     zero = val_T * 0.0
     val_y = _select_col3_value(col, y0, y1, y2, zero)
 
-    val_d = -val_y / det
+    val_d = -val_y / T.max(det, _EPS)
     fallback_d = T.if_then_else(col < 3, -val_g, 0.0)
-    return T.if_then_else(T.Or(det <= _EPS, rho > 1000.0), fallback_d, val_d)
+    return T.if_then_else(det <= _EPS, fallback_d, val_d)
 
 
 @T.macro
@@ -355,10 +355,13 @@ def birkhoff_proj_n4_forward(
     R: torch.Tensor, tol: float = 1e-6
 ) -> dict[str, torch.Tensor]:
     _check_n4_tensor("R", R)
+    if not math.isfinite(tol) or tol <= 0:
+        raise ValueError("tol must be positive and finite")
     src_options = {"device": R.device, "dtype": R.dtype}
     R_work = _float32_contiguous(R)
     T_out = torch.empty_like(R_work)
-    _birkhoff_proj_n4_forward_kernel(R_work, T_out, float(tol))
+    if R.shape[0] > 0:
+        _birkhoff_proj_n4_forward_kernel(R_work, T_out, float(tol))
     return {"T": T_out.to(**src_options)}
 
 
@@ -369,13 +372,16 @@ def birkhoff_proj_n4_backward(
     _check_n4_tensor("T_proj", T_proj)
     if G.shape != T_proj.shape:
         raise ValueError("G and T_proj must have the same shape")
+    if G.device != T_proj.device:
+        raise ValueError("G and T_proj must be on the same device")
 
     src_options = {"device": G.device, "dtype": G.dtype}
     G_work = _float32_contiguous(G)
     T_work = _float32_contiguous(T_proj)
     D = torch.empty_like(G_work)
 
-    _birkhoff_proj_n4_backward_kernel(G_work, T_work, D)
+    if G.shape[0] > 0:
+        _birkhoff_proj_n4_backward_kernel(G_work, T_work, D)
     return {"D": D.to(**src_options)}
 
 

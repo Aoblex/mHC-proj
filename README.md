@@ -138,24 +138,24 @@ print(D3)
 We benchmark the following open-source implementations on an Nvidia RTX 6000 Ada GPU:
 
 1. **Vanilla**: A simple implementation of the Sinkhorn–Knopp algorithm using pure PyTorch code.
-2. **Triton-Sinkhorn**: A CUDA-fused implementation of the Sinkhorn–Knopp algorithm backed by OpenAI Trition: https://github.com/LottoLottoLotto/triton-sinkhorn.
+2. **Triton-Sinkhorn**: A CUDA-fused implementation of the Sinkhorn–Knopp algorithm backed by OpenAI Triton: https://github.com/LottoLottoLotto/triton-sinkhorn.
 3. **mHC.cu**: A CUDA implementation of mHC, with specialized optimizations for $n=4$: https://github.com/AndreSlavescu/mHC.cu.
 4. **TileLangExamples**: A [TileLang](https://github.com/tile-ai/tilelang) implementation of the Sinkhorn-Knopp algorithm adapted from the TileLang examples, with a backward pass using implicit conjugate gradient: https://github.com/tile-ai/tilelang/tree/main/examples/deepseek_mhc.
 5. **TileKernels**: A TileLang implementation of the Sinkhorn-Knopp algorithm adapted from the DeepSeek TileKernels implementation: https://github.com/deepseek-ai/TileKernels.
 6. **mHC-proj-TL**: A TileLang implementation of the proposed second-order Birkhoff projection solver: https://github.com/yixuan/mHC-proj/tree/master/benchmark/mhc/tilelang.
-4. **mHC-proj**: This library.
+7. **mHC-proj**: This library.
 
 The test code can be found in the [benchmark](benchmark) directory.
 
 ### Accuracy
 
-We randomly generate $N=10000$ matrices of size $4\times 4$, forming an $N\times 4\times 4$ tensor $R$ as the input of the four implementations. Each of them outputs a tensor $T$ consisting of $N$ matrices of size $4\times 4$. If the projection is accurate, then each $T_i$ is doubly stochastic, so we measure the error as
+We randomly generate $N=10000$ matrices of size $4\times 4$, forming an $N\times 4\times 4$ tensor $R$ as the input of the seven implementations. Each of them outputs a tensor $T$ consisting of $N$ matrices of size $4\times 4$. If the projection is accurate, then each $T_i$ is doubly stochastic, so we measure the error as
 
 $$
 \mathrm{Err}(T_i)=\Vert T_i\mathbf{1}_4-\mathbf{1}_4 \Vert_1 + \Vert T_i^\top\mathbf{1}_4-\mathbf{1}_4 \Vert_1.
 $$
 
-The mean, median, and maximum of the $N$ error values are summarized below:
+The mean, standard deviation, median, and maximum of the $N$ error values are summarized below:
 
 ![](benchmark/table1.png)
 
@@ -165,6 +165,6 @@ If the magnitudes of the entries are larger, then mHC-proj demonstrates larger a
 
 ### Run time
 
-We fix the input distribution to be $N(0,10^2)$, and measure the run time of different implementations for various batch sizes $N$. The time is normalized such that in each configuration **mHC-proj** has one unit of run time.
+We fix the input distribution to be $N(0,10^2)$, reuse the original input on every call, and measure the run time of different implementations for various batch sizes $N$. The time is normalized such that in each configuration **mHC-proj** has one unit of run time.
 
 ![](benchmark/table3.png)

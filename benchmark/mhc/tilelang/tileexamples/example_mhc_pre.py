@@ -175,9 +175,9 @@ def mhc_pre_gemm_sqrsum_tilelang(
             x_smem_16 = T.alloc_shared((token_block, hidden_block), T.bfloat16)
             fn_smem = T.alloc_shared((32, hidden_block), T.float32)
 
-            T.annotate_layout({
-                x_smem_16: tilelang.layout.make_swizzled_layout(x_smem_16)
-            })
+            T.annotate_layout(
+                {x_smem_16: tilelang.layout.make_swizzled_layout(x_smem_16)}
+            )
 
             T.copy(x[px * token_block, pz * hidden_block], x_smem_16)
             T.copy(fn[0, pz * hidden_block], fn_smem)
@@ -389,8 +389,7 @@ def generate_test_data(
     device = "cuda"
 
     residual = (
-        torch
-        .randn((n, hc_mult, hidden_size), dtype=torch.float, device=device)
+        torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device)
         .mul(1 + torch.arange(hc_mult, device=device).mul(0.01).view(1, -1, 1))
         .bfloat16()
     )

@@ -82,7 +82,9 @@ def sinkhorn_bwd_implicit_cg(n_stream: int, tilesize: int = 32, threads: int = 1
     @T.macro
     def dot(x1, x2, y1, y2, buf, out):
         for i_tile, i in T.Parallel(tilesize, n_stream):
-            buf[i_tile, i] = x1[i_tile, i] * y1[i_tile, i] + x2[i_tile, i] * y2[i_tile, i]
+            buf[i_tile, i] = (
+                x1[i_tile, i] * y1[i_tile, i] + x2[i_tile, i] * y2[i_tile, i]
+            )
 
         T.reduce_sum(buf, out, dim=-1)
 
@@ -166,15 +168,21 @@ def sinkhorn_bwd_implicit_cg(n_stream: int, tilesize: int = 32, threads: int = 1
                     # not very important to avoid divide by zero, but it's good to have it
                     beta[i_tile, i_n] = r_new_normsq[i_tile] / (r_normsq[i_tile] + EPS)
                 for i_tile, i_n in T.Parallel(tilesize, n_stream):
-                    p1[i_tile, i_n] = r1[i_tile, i_n] + beta[i_tile, i_n] * p1[i_tile, i_n]
+                    p1[i_tile, i_n] = (
+                        r1[i_tile, i_n] + beta[i_tile, i_n] * p1[i_tile, i_n]
+                    )
                 for i_tile, i_n in T.Parallel(tilesize, n_stream):
-                    p2[i_tile, i_n] = r2[i_tile, i_n] + beta[i_tile, i_n] * p2[i_tile, i_n]
+                    p2[i_tile, i_n] = (
+                        r2[i_tile, i_n] + beta[i_tile, i_n] * p2[i_tile, i_n]
+                    )
 
                 T.copy(r_new_normsq, r_normsq)
             # Conjugate gradient: iteration ends
 
             for i_tile, i_nx, i_ny in T.Parallel(tilesize, n_stream, n_stream):
-                res_tile[i_tile, i_nx, i_ny] = (dR[i_tile, i_nx, i_ny] - x1[i_tile, i_nx] - x2[i_tile, i_ny]) * R[i_tile, i_nx, i_ny]
+                res_tile[i_tile, i_nx, i_ny] = (
+                    dR[i_tile, i_nx, i_ny] - x1[i_tile, i_nx] - x2[i_tile, i_ny]
+                ) * R[i_tile, i_nx, i_ny]
 
             T.copy(res_tile, res[i_seq * tilesize : (i_seq + 1) * tilesize, :, :])
 

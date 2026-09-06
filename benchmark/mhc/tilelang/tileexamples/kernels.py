@@ -2,14 +2,21 @@ import tilelang
 import tilelang.language as T
 import torch
 
-
 _N4 = 4
+_N8 = 8
 EPS = 1e-10
 
 
 def _check_square_tensor(name: str, tensor: torch.Tensor, n: int) -> None:
     if tensor.ndim != 3 or tensor.shape[-2:] != (n, n):
         raise ValueError(f"{name} must be a tensor of size B x {n} x {n}")
+    if not tensor.is_floating_point():
+        raise TypeError(f"{name} must be a floating-point tensor")
+
+
+def _check_max_iter(max_iter: int) -> None:
+    if not isinstance(max_iter, int) or max_iter < 1:
+        raise ValueError("max_iter must be a positive integer")
 
 
 def _cuda_float_contiguous(tensor: torch.Tensor) -> torch.Tensor:
@@ -103,8 +110,7 @@ def _mhc_sinkhorn_bwd_implicit_cg_tilelang(
     def dot(x1, x2, y1, y2, buf, out):
         for i_tile, i in T.Parallel(tilesize, n_stream):
             buf[i_tile, i] = (
-                x1[i_tile, i] * y1[i_tile, i]
-                + x2[i_tile, i] * y2[i_tile, i]
+                x1[i_tile, i] * y1[i_tile, i] + x2[i_tile, i] * y2[i_tile, i]
             )
 
         T.reduce_sum(buf, out, dim=-1)
@@ -191,13 +197,15 @@ def _mhc_sinkhorn_bwd_implicit_cg_tilelang(
                 dot(r1, r2, r1, r2, buf2, r_new_normsq)
 
                 for i_tile, i_n in T.Parallel(tilesize, n_stream):
-                    beta[i_tile, i_n] = r_new_normsq[i_tile] / (
-                        r_normsq[i_tile] + EPS
+                    beta[i_tile, i_n] = r_new_normsq[i_tile] / (r_normsq[i_tile] + EPS)
+                for i_tile, i_n in T.Parallel(tilesize, n_stream):
+                    p1[i_tile, i_n] = (
+                        r1[i_tile, i_n] + beta[i_tile, i_n] * p1[i_tile, i_n]
                     )
                 for i_tile, i_n in T.Parallel(tilesize, n_stream):
-                    p1[i_tile, i_n] = r1[i_tile, i_n] + beta[i_tile, i_n] * p1[i_tile, i_n]
-                for i_tile, i_n in T.Parallel(tilesize, n_stream):
-                    p2[i_tile, i_n] = r2[i_tile, i_n] + beta[i_tile, i_n] * p2[i_tile, i_n]
+                    p2[i_tile, i_n] = (
+                        r2[i_tile, i_n] + beta[i_tile, i_n] * p2[i_tile, i_n]
+                    )
 
                 T.copy(r_new_normsq, r_normsq)
             # Conjugate gradient: iteration ends
@@ -215,33 +223,67 @@ def _mhc_sinkhorn_bwd_implicit_cg_tilelang(
     return main
 
 
-def sinkhorn_knopp_tileexamples_n4_forward(
-    R: torch.Tensor, max_iter: int = 20, eps: float = 1e-6
+def _sinkhorn_knopp_tileexamples_forward(
+    R: torch.Tensor,
+    n: int,
+    max_iter: int = 20,
+    eps: float = 1e-6,
 ) -> dict[str, torch.Tensor]:
-    _check_square_tensor("R", R, _N4)
+    _check_square_tensor("R", R, n)
+    _check_max_iter(max_iter)
     src_options = {"device": R.device, "dtype": R.dtype}
     comb_mix = _cuda_float_contiguous(R)
     comb_mix_out = torch.empty_like(comb_mix)
 
-    _mhc_sinkhorn_fwd_tilelang(comb_mix, comb_mix_out, max_iter, eps, _N4)
+    if R.shape[0] > 0:
+        _mhc_sinkhorn_fwd_tilelang(comb_mix, comb_mix_out, max_iter, eps, n)
 
     return {"T": comb_mix_out.to(**src_options)}
 
 
-def sinkhorn_knopp_tileexamples_n4_backward(
-    G: torch.Tensor, T_out: torch.Tensor
+def _sinkhorn_knopp_tileexamples_backward(
+    G: torch.Tensor,
+    T_out: torch.Tensor,
+    n: int,
 ) -> dict[str, torch.Tensor]:
-    _check_square_tensor("G", G, _N4)
-    _check_square_tensor("T_out", T_out, _N4)
+    _check_square_tensor("G", G, n)
+    _check_square_tensor("T_out", T_out, n)
     if G.shape != T_out.shape:
         raise ValueError("G and T_out must have the same shape")
+    if G.device != T_out.device:
+        raise ValueError("G and T_out must be on the same device")
 
     src_options = {"device": G.device, "dtype": G.dtype}
     dout = _cuda_float_contiguous(G)
     out = _cuda_float_contiguous(T_out)
     res = torch.empty_like(dout)
 
-    kernel = _mhc_sinkhorn_bwd_implicit_cg_tilelang(_N4)
-    kernel(out, dout, res)
+    if G.shape[0] > 0:
+        kernel = _mhc_sinkhorn_bwd_implicit_cg_tilelang(n)
+        kernel(out, dout, res)
 
     return {"D": res.to(**src_options)}
+
+
+def sinkhorn_knopp_tileexamples_n4_forward(
+    R: torch.Tensor, max_iter: int = 20, eps: float = 1e-6
+) -> dict[str, torch.Tensor]:
+    return _sinkhorn_knopp_tileexamples_forward(R, _N4, max_iter, eps)
+
+
+def sinkhorn_knopp_tileexamples_n4_backward(
+    G: torch.Tensor, T_out: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    return _sinkhorn_knopp_tileexamples_backward(G, T_out, _N4)
+
+
+def sinkhorn_knopp_tileexamples_n8_forward(
+    R: torch.Tensor, max_iter: int = 20, eps: float = 1e-6
+) -> dict[str, torch.Tensor]:
+    return _sinkhorn_knopp_tileexamples_forward(R, _N8, max_iter, eps)
+
+
+def sinkhorn_knopp_tileexamples_n8_backward(
+    G: torch.Tensor, T_out: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    return _sinkhorn_knopp_tileexamples_backward(G, T_out, _N8)
