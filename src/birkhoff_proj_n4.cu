@@ -254,6 +254,24 @@ __device__ __forceinline__ float compute_f_gradient
     return gnorm;
 }
 
+// For small steps s, reweight T by exp(s) and evaluate the objective change
+// directly. expm1/log1p preserve changes lost when comparing absolute FP32
+// objectives near convergence. Use the actual FP32 row mass, not exactly one.
+__device__ __forceinline__ float compute_relative_candidate(
+    float val_T, float step, float step_sum, int col, unsigned int mask,
+    float& out_c, float& out_T, float& out_delta
+)
+{
+    const float change = expm1f(step);
+    const float diff = warp_reduce_sum_row(val_T * change, mask);
+    const float mass = warp_reduce_sum_row(val_T, mask);
+    out_T = fmaf(val_T, change, val_T) / (mass + diff);
+    out_delta = warp_reduce_sum_col(log1pf(diff / mass), mask) - step_sum;
+    out_c = warp_reduce_sum_col(out_T, mask);
+    const float val_g = (col < 3) ? (out_c - 1.0f) : 0.0f;
+    return warp_reduce_sum_row(fabsf(val_g), mask);
+}
+
 // Compute the Newton direction for current beta
 //
 // For thread at (row, col):
@@ -435,6 +453,9 @@ __global__ void birkhoff_proj_n4_kernel(
             val_c, val_T, current_gnorm, row, col, lane_id, base_lane_id, active_mask
         );
 
+        const float direction_max = warp_reduce_max_row(fabsf(val_d), active_mask);
+        const float direction_sum = warp_reduce_sum_row(val_d, active_mask);
+
         // Line search
         // bool step_accepted = false;
         #pragma unroll 1
@@ -447,21 +468,34 @@ __global__ void birkhoff_proj_n4_kernel(
             // candidate_beta = 0 for col = 3
             const float candidate_beta = val_beta + gamma * val_d;
 
-            // Compute gradient
-            float candidate_c = 0.0f, candidate_T = 0.0f, candidate_f = 0.0f;
-            const float candidate_gnorm = compute_f_gradient(
-                candidate_beta, val_R, row, col, base_lane_id, active_mask,
-                candidate_c, candidate_T, candidate_f
-            );
+            float candidate_c = 0.0f, candidate_T = 0.0f, objective_delta = 0.0f;
+            float candidate_gnorm;
+            // Large steps still use logits so underflowed entries can recover.
+            if (gamma * direction_max < 0.5f)
+            {
+                candidate_gnorm = compute_relative_candidate(
+                    val_T, gamma * val_d, gamma * direction_sum, col, active_mask,
+                    candidate_c, candidate_T, objective_delta
+                );
+            }
+            else
+            {
+                float candidate_f;
+                candidate_gnorm = compute_f_gradient(
+                    candidate_beta, val_R, row, col, base_lane_id, active_mask,
+                    candidate_c, candidate_T, candidate_f
+                );
+                objective_delta = candidate_f - current_f;
+            }
 
             // Test line search condition (objective function value and gradient norm decrease)
-            if (candidate_f < current_f && candidate_gnorm < current_gnorm)
+            if (objective_delta < 0.0f && candidate_gnorm < current_gnorm)
             {
                 // Accept step and update related variables
                 val_beta = candidate_beta;
                 val_c = candidate_c;
                 val_T = candidate_T;
-                current_f = candidate_f;
+                current_f += objective_delta;
                 current_gnorm = candidate_gnorm;
                 // step_accepted = true;
                 break;
@@ -485,6 +519,11 @@ __global__ void birkhoff_proj_n4_kernel(
         }
     }
 
+    // Reconstruct from the final dual variables before implicit backward;
+    // repeated multiplicative updates otherwise accumulate FP32 row error.
+    compute_gradient(
+        val_beta, val_R, row, col, base_lane_id, active_mask, val_c, val_T
+    );
     // Write T
     T[ind_mat] = val_T;
 }

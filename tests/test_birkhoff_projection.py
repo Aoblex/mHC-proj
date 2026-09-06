@@ -77,16 +77,19 @@ def test_projection_forward_backward(
     _check_forward_backward(module_type(tol=1e-6), n)
 
 
-@pytest.mark.parametrize("batch_size", [128, 32768])
-def test_n8_projection_matches_float64_reference(batch_size: int) -> None:
-    """Exercise both forward schedules and the small-step convergence path."""
+@pytest.mark.parametrize(("n", "module_type"), PROJECTION_MODULES)
+@pytest.mark.parametrize("batch_size", [128, 129, 32768])
+def test_projection_matches_float64_reference(
+    n: int, module_type: type[torch.nn.Module], batch_size: int
+) -> None:
+    """Exercise small-step convergence, partial warps, and both n8 schedules."""
     torch.manual_seed(2026)
-    logits = torch.randn(batch_size, 8, 8, device="cuda", requires_grad=True)
+    logits = torch.randn(batch_size, n, n, device="cuda", requires_grad=True)
     upstream = torch.randn_like(logits)
 
     # Independent FP64 Sinkhorn reference on well-conditioned random inputs.
     target = logits.detach().double().exp()
-    for _ in range(100):
+    for _ in range(200):
         target = target / target.sum(dim=-1, keepdim=True)
         target = target / target.sum(dim=-2, keepdim=True)
     torch.testing.assert_close(
@@ -97,18 +100,18 @@ def test_n8_projection_matches_float64_reference(batch_size: int) -> None:
     rhs = weighted.sum(dim=-2) - (
         target.transpose(-1, -2) @ row_rhs.unsqueeze(-1)
     ).squeeze(-1)
-    reduced = target[:, :, :7]
-    hessian = torch.eye(7, dtype=torch.float64, device="cuda") - (
+    reduced = target[:, :, : n - 1]
+    hessian = torch.eye(n - 1, dtype=torch.float64, device="cuda") - (
         reduced.transpose(-1, -2) @ reduced
     )
-    column_dual = torch.linalg.solve(hessian, rhs[:, :7])
+    column_dual = torch.linalg.solve(hessian, rhs[:, : n - 1])
     column_dual = torch.cat((column_dual, torch.zeros_like(rhs[:, :1])), dim=-1)
     row_dual = row_rhs - (target @ column_dual.unsqueeze(-1)).squeeze(-1)
     expected_gradient = (
         upstream.double() - row_dual.unsqueeze(-1) - column_dual.unsqueeze(-2)
     ) * target
 
-    output = mhc_proj.MHCProjectionN8(tol=1e-6)(logits)
+    output = module_type(tol=1e-6)(logits)
     gradient = torch.autograd.grad(output, logits, upstream)[0]
     torch.testing.assert_close(output.double(), target, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(
