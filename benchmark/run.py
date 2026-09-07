@@ -205,7 +205,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale", type=int, nargs="+", default=(1, 10))
     parser.add_argument("--accuracy-batch-size", type=int, default=10000)
     parser.add_argument(
-        "--batch-size", type=int, nargs="+", default=(512, 2048, 8192, 32768, 131072)
+        "--batch-size", type=int, nargs="+", default=(512, 2048, 8192, 32768, 65536, 131072)
     )
     parser.add_argument(
         "--backends", nargs="+", choices=tuple(BACKENDS), default=tuple(BACKENDS)

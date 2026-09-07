@@ -171,6 +171,6 @@ def test_defaults(runtime, monkeypatch):
     assert args.n == (4,)
     assert args.scale == (1, 10)
     assert args.accuracy_batch_size == 10000
-    assert args.batch_size == (512, 2048, 8192, 32768, 131072)
+    assert args.batch_size == (512, 2048, 8192, 32768, 65536, 131072)
     assert (args.warmup, args.iterations, args.runs) == (100, 100, 10)
     assert not args.overwrite
