@@ -36,6 +36,13 @@ def recorded(tmp_path):
         "accuracy": {"batch_size": 4, "distributions": ["normal", "uniform"]},
         "runtime": {"batch_sizes": [512], "runs": 3, "modes": ["forward", "forward_backward"]},
     }
+    config["accuracy"]["colors"] = {
+        distribution: {
+            "other": ["Salmon", "Goldenrod", "lime", "Salmon"],
+            "mHC-proj": ["lime"] * 4,
+        }
+        for distribution in config["accuracy"]["distributions"]
+    }
     (directory / "config.json").write_text(json.dumps(config))
     accuracy = [
         dict(distribution=distribution, backend=backend, matrix_index=i, error=v * scale)
@@ -100,3 +107,63 @@ def test_plots_and_selected_publication_are_reproducible(plotting, recorded):
     assert hashlib.sha256(image.read_bytes()).digest() == before
     assert [p.name for p in plotting.ASSETS_DIR.iterdir()] == ["sm89-n8-accuracy-scale10.png"]
     assert (plotting.ASSETS_DIR / "sm89-n8-accuracy-scale10.png").read_bytes() == image.read_bytes()
+
+
+@pytest.mark.parametrize("annotated", [True, False])
+def test_accuracy_uses_explicit_cell_colors(plotting, recorded, monkeypatch, annotated):
+    directory, config = recorded
+    if not annotated:
+        del config["accuracy"]["colors"]
+    values = plotting.accuracy_statistics(directory / "accuracy.csv", config)
+    figures = []
+    monkeypatch.setattr(plotting, "save", lambda fig, path: figures.append(fig))
+    plotting.draw_accuracy(directory / "accuracy.png", config, values)
+    try:
+        colors = [plotting.matplotlib.colors.to_hex(p.get_facecolor())
+                  for p in figures[0].axes[0].patches]
+        expected = (["#f49289", "#ffde44", "#bfff00", "#f49289"] + ["#bfff00"] * 4) * 2
+        assert colors == (expected if annotated else [])
+    finally:
+        plotting.plt.close(figures[0])
+
+
+@pytest.mark.parametrize(("n", "scale", "table", "magnitude"), [
+    (4, 1, 1, "small"), (8, 10, 2, "large"),
+])
+def test_original_captions_and_runtime_columns(plotting, recorded, monkeypatch, n, scale, table, magnitude):
+    directory, config = recorded
+    config.update(n=n, scale=scale)
+    captions, figures = [], []
+    canvas = plotting.canvas
+
+    def capture(count, caption, **kwargs):
+        captions.append(caption)
+        return canvas(count, caption, **kwargs)
+
+    def save(fig, path):
+        figures.append(fig)
+        plotting.plt.close(fig)
+
+    monkeypatch.setattr(plotting, "canvas", capture)
+    monkeypatch.setattr(plotting, "save", save)
+    values = plotting.accuracy_statistics(directory / "accuracy.csv", config)
+    plotting.draw_accuracy(directory / "accuracy.png", config, values)
+    assert captions[0] == (
+        f"Table {table}: Accuracy of different projection methods "
+        f"for {magnitude}-magnitude inputs."
+    )
+    assert rf'$n={n}$' in [t.get_text() for t in figures[0].axes[0].texts]
+    assert len(figures[0].axes[0].patches) == 16
+    config["backends"] = list(plotting.SHORT_NAMES)
+    ratios = {(mode, 512, name): 1 for mode in config["runtime"]["modes"] for name in config["backends"]}
+    plotting.draw_runtime(directory / "runtime.png", config, ratios)
+    assert captions[1].startswith(
+        f"Table 3: Median normalized computational time of different projection methods (n={n})."
+    )
+    assert config["device"]["name"] not in " ".join(captions)
+    headings = {t.get_text(): t.get_position()[0] for t in figures[1].axes[0].texts}
+    assert headings["Vanilla"] < headings["Proj-TL"] < headings["Proj"]
+    assert "mHC.cu" in headings
+    assert not figures[1].axes[0].patches
+    top_rule = figures[1].axes[0].collections[0].get_segments()[0][0][1]
+    assert all(t.get_ha() == "left" for t in figures[1].axes[0].texts if t.get_position()[1] < top_rule)
