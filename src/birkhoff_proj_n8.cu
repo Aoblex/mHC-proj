@@ -1,4 +1,5 @@
-// One warp processes one 8x8 matrix.  Lane l owns two entries in one column:
+// Small-batch schedule: one warp processes one 8x8 matrix.
+// Lane l owns two entries in one column:
 //   (row0, col) = (l / 8, l % 8)
 //   (row1, col) = (row0 + 4, col)
 
@@ -13,9 +14,9 @@ constexpr int BLOCK_DIM = 128;
 constexpr int WARPS_PER_BLOCK = BLOCK_DIM / 32;
 constexpr int NEWTON_MAX_ITERS = 20;
 constexpr int LINE_SEARCH_MAX_ITERS = 5;
-// Cholesky minimizes latency; packed LDL^T wins once the batch exposes enough
-// independent matrices to hide its serial dependency chain.
-constexpr int LDLT_MIN_BATCH_SIZE = 32768;
+// Keep the original small-batch Cholesky schedule. Saturated batches use
+// row-owned forward with packed LDL^T; half-warp backward remains Cholesky.
+constexpr int LARGE_BATCH_MIN_SIZE = 32768;
 constexpr float EPSILON = 1e-8f;
 constexpr unsigned int FULL_MASK = 0xffffffffu;
 
@@ -704,6 +705,379 @@ __global__ void birkhoff_proj_n8_backward_kernel(
 
 }  // namespace birkhoff_n8
 
+// Large-batch backward: two independent matrices per warp, four entries
+// per thread.
+namespace birkhoff_n8::halfwarp {
+constexpr int THREADS_PER_MATRIX = 16;
+constexpr int ROW_GROUPS = THREADS_PER_MATRIX / MATRIX_SIZE;
+constexpr int ROWS_PER_THREAD = MATRIX_SIZE / ROW_GROUPS;
+constexpr int MATRICES_PER_BLOCK = BLOCK_DIM / THREADS_PER_MATRIX;
+using Values = float[ROWS_PER_THREAD];
+
+__device__ __forceinline__ unsigned int matrix_mask()
+{
+    const int base = (threadIdx.x & 31) & ~(THREADS_PER_MATRIX - 1);
+    return (0xffffffffu >> (32 - THREADS_PER_MATRIX)) << base;
+}
+
+__device__ __forceinline__ float warp_reduce_sum_row(float value)
+{
+    value += __shfl_xor_sync(matrix_mask(), value, 1, 8);
+    value += __shfl_xor_sync(matrix_mask(), value, 2, 8);
+    value += __shfl_xor_sync(matrix_mask(), value, 4, 8);
+    return value;
+}
+
+__device__ __forceinline__ float warp_reduce_sum_col(const Values& values)
+{
+    // Match the original 32-thread summation tree, including its grouping.
+    float first = values[0] + values[2];
+    float second = values[1] + values[3];
+    first += __shfl_xor_sync(matrix_mask(), first, 8, THREADS_PER_MATRIX);
+    second += __shfl_xor_sync(matrix_mask(), second, 8, THREADS_PER_MATRIX);
+    return first + second;
+}
+
+// Preserve the cyclic schedule for the 28 lower-triangle entries.
+__device__ __forceinline__ void build_hessian(
+    const Values& T, float diagonal, float damping, int lane, int col, float* H)
+{
+    #pragma unroll
+    for (int round = 0; round < 4; ++round)
+    {
+        const int owner = col < REDUCED_SIZE ? col : 0;
+        int other = owner + round;
+        if (other >= REDUCED_SIZE) other -= REDUCED_SIZE;
+        Values products;
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_THREAD; ++r)
+        {
+            const float t = round == 0 ? T[r] : __shfl_sync(matrix_mask(), T[r], other, 8);
+            products[r] = T[r] * t;
+        }
+        float h = -warp_reduce_sum_col(products);
+        if (round == 0) h += diagonal + damping;
+        if (lane < REDUCED_SIZE)
+            H[max(owner, other) * REDUCED_SIZE + min(owner, other)] = h;
+    }
+}
+
+__global__ void birkhoff_proj_n8_backward_kernel(
+    const float* __restrict__ G, const float* __restrict__ T,
+    float* __restrict__ D, int batch_size)
+{
+    __shared__ float shared_H[MATRICES_PER_BLOCK][REDUCED_SIZE * REDUCED_SIZE];
+    __shared__ float shared_rhs[MATRICES_PER_BLOCK][REDUCED_SIZE];
+    __shared__ float shared_x[MATRICES_PER_BLOCK][REDUCED_SIZE];
+    const int group = threadIdx.x / THREADS_PER_MATRIX;
+    const int lane = threadIdx.x % THREADS_PER_MATRIX;
+    const int instance = blockIdx.x * MATRICES_PER_BLOCK + group;
+    if (instance >= batch_size) return;
+    const int col = lane & 7;
+    const int row = lane >> 3;
+    const int offset = instance * MATRIX_SIZE * MATRIX_SIZE;
+    Values values_G, values_T, gamma, mur, weighted_mur;
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_THREAD; ++r)
+    {
+        const int index = offset + (row + r * ROW_GROUPS) * MATRIX_SIZE + col;
+        values_G[r] = G[index];
+        values_T[r] = T[index];
+        gamma[r] = values_G[r] * values_T[r];
+        mur[r] = warp_reduce_sum_row(gamma[r]);
+        weighted_mur[r] = values_T[r] * mur[r];
+    }
+    const float muc = warp_reduce_sum_col(gamma);
+    const float Tmur = warp_reduce_sum_col(weighted_mur);
+    const float rhs = col < REDUCED_SIZE ? muc - Tmur : 0.0f;
+    build_hessian(values_T, 1.0f, 0.0f, lane, col, shared_H[group]);
+    if (lane < REDUCED_SIZE) shared_rhs[group][lane] = rhs;
+    __syncwarp(matrix_mask());
+    if (lane == 0) cholesky_solve(shared_H[group], shared_rhs[group], shared_x[group]);
+    __syncwarp(matrix_mask());
+    const float w = col < REDUCED_SIZE ? shared_x[group][col] : 0.0f;
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_THREAD; ++r)
+    {
+        const float v = mur[r] - warp_reduce_sum_row(values_T[r] * w);
+        D[offset + (row + r * ROW_GROUPS) * MATRIX_SIZE + col] = (values_G[r] - v - w) * values_T[r];
+    }
+}
+} // namespace birkhoff_n8::halfwarp
+
+// Large-batch forward: four threads own two complete rows each.
+// Row reductions stay in registers; a warp advances eight independent matrices.
+namespace birkhoff_n8::quarterwarp {
+constexpr int THREADS_PER_MATRIX = 4;
+constexpr int MATRICES_PER_BLOCK = BLOCK_DIM / THREADS_PER_MATRIX;
+using Row = float[8];
+using Matrix = float[2][8];
+
+__device__ __forceinline__ unsigned matrix_mask()
+{
+    return 0xfu << (threadIdx.x & 28);
+}
+
+__device__ __forceinline__ float column_sum(float v)
+{
+    v += __shfl_xor_sync(matrix_mask(), v, 1, 4);
+    v += __shfl_xor_sync(matrix_mask(), v, 2, 4);
+    return v;
+}
+
+__device__ __forceinline__ float column_max(float v)
+{
+    v = fmaxf(v, __shfl_xor_sync(matrix_mask(), v, 1, 4));
+    v = fmaxf(v, __shfl_xor_sync(matrix_mask(), v, 2, 4));
+    return v;
+}
+
+__device__ __forceinline__ float row_sum(const Row& v)
+{
+    // Preserve the warp reduction tree without contraction across its stages.
+    const float a = __fadd_rn(v[0], v[1]);
+    const float b = __fadd_rn(v[2], v[3]);
+    const float c = __fadd_rn(v[4], v[5]);
+    const float d = __fadd_rn(v[6], v[7]);
+    return __fadd_rn(__fadd_rn(a, b), __fadd_rn(c, d));
+}
+
+__device__ __forceinline__ float row_max(const Row& v)
+{
+    return fmaxf(fmaxf(fmaxf(v[0], v[1]), fmaxf(v[2], v[3])),
+                 fmaxf(fmaxf(v[4], v[5]), fmaxf(v[6], v[7])));
+}
+
+__device__ __forceinline__ float objective(
+    const Matrix& R, const Row& beta, float beta_sum, Matrix& T)
+{
+    float alpha[2];
+    #pragma unroll
+    for (int r = 0; r < 2; ++r)
+    {
+        Row u, e;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) u[j] = R[r][j] + beta[j];
+        const float maximum = row_max(u);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) e[j] = expf(u[j] - maximum);
+        const float mass = row_sum(e);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) T[r][j] = e[j] / mass;
+        alpha[r] = -maximum - logf(mass);
+    }
+    return -column_sum(alpha[0] + alpha[1]) - beta_sum;
+}
+
+__device__ __forceinline__ float gradient(const Matrix& T, Row& c)
+{
+    Row g;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+    {
+        c[j] = column_sum(T[0][j] + T[1][j]);
+        g[j] = j < 7 ? fabsf(c[j] - 1.0f) : 0.0f;
+    }
+    return row_sum(g);
+}
+
+__device__ __forceinline__ float initialize(
+    const Matrix& R, Row& beta, float& beta_sum)
+{
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+    {
+        const float maximum = column_max(fmaxf(R[0][j], R[1][j]));
+        const float mass = column_sum(expf(R[0][j] - maximum) + expf(R[1][j] - maximum));
+        beta[j] = -maximum - logf(mass);
+    }
+    const float sum = row_sum(beta);
+    const float last = beta[7];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) beta[j] -= last;
+    beta_sum = sum - 8 * last;
+    return -sum;
+}
+
+__device__ __forceinline__ float relative_candidate(
+    const Matrix& T, const Row& step, float step_sum, Matrix& candidate)
+{
+    Row change;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) change[j] = expm1f(step[j]);
+    float logarithm[2];
+    #pragma unroll
+    for (int r = 0; r < 2; ++r)
+    {
+        Row products;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) products[j] = T[r][j] * change[j];
+        const float diff = row_sum(products), mass = row_sum(T[r]);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            candidate[r][j] = fmaf(T[r][j], change[j], T[r][j]) / (mass + diff);
+        logarithm[r] = log1pf(diff / mass);
+    }
+    return column_sum(logarithm[0] + logarithm[1]) - step_sum;
+}
+
+__device__ __forceinline__ void sinkhorn(const Matrix& R, Row& beta)
+{
+    Matrix v;
+    #pragma unroll
+    for (int r = 0; r < 2; ++r)
+    {
+        Row u, e;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) u[j] = R[r][j] + beta[j];
+        const float maximum = row_max(u);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) e[j] = expf(u[j] - maximum);
+        const float alpha = -maximum - logf(row_sum(e));
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) v[r][j] = R[r][j] + alpha;
+    }
+    #pragma unroll
+    for (int j = 0; j < 8; ++j)
+    {
+        const float maximum = column_max(fmaxf(v[0][j], v[1][j]));
+        const float mass = column_sum(expf(v[0][j] - maximum) + expf(v[1][j] - maximum));
+        beta[j] = -maximum - logf(mass);
+    }
+    const float last = beta[7];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) beta[j] -= last;
+}
+
+__device__ __forceinline__ void hessian(
+    const Matrix& T, const Row& c, float damping, int lane, float* H)
+{
+    #pragma unroll
+    for (int round = 0; round < 4; ++round)
+    {
+        #pragma unroll
+        for (int owner = 0; owner < 7; ++owner)
+        {
+            const int other = (owner + round) % 7;
+            float h = -column_sum(T[0][owner] * T[0][other] + T[1][owner] * T[1][other]);
+            if (round == 0) h += c[owner] + damping;
+            if (lane == owner % 4) H[max(owner, other) * 7 + min(owner, other)] = h;
+        }
+    }
+}
+
+__global__ void birkhoff_proj_n8_kernel(
+    const float* __restrict__ R, float* __restrict__ T, float tol, int batch_size)
+{
+    __shared__ float shared_H[MATRICES_PER_BLOCK][49];
+    __shared__ float shared_rhs[MATRICES_PER_BLOCK][7];
+    __shared__ float shared_x[MATRICES_PER_BLOCK][7];
+    const int group = threadIdx.x / 4, lane = threadIdx.x % 4;
+    const int instance = blockIdx.x * MATRICES_PER_BLOCK + group;
+    if (instance >= batch_size) return;
+    Matrix values_R, values_T;
+    #pragma unroll
+    for (int r = 0; r < 2; ++r)
+    {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            values_R[r][j] = R[instance * 64 + (lane + 4 * r) * 8 + j];
+    }
+    Row beta = {}, c;
+    float beta_sum = 0.0f;
+    float f = objective(values_R, beta, beta_sum, values_T);
+    float gnorm = gradient(values_T, c);
+    Row beta0;
+    float sum0;
+    const float f0 = initialize(values_R, beta0, sum0);
+    if (f0 < f)
+    {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) beta[j] = beta0[j];
+        beta_sum = sum0;
+        f = objective(values_R, beta, beta_sum, values_T);
+        gnorm = gradient(values_T, c);
+    }
+    constexpr float gammas[LINE_SEARCH_MAX_ITERS] = {1.0f, 0.5f, 0.1f, 0.05f, 0.01f};
+    if (gnorm >= tol)
+    {
+        #pragma unroll 1
+        for (int iter = 0; iter < NEWTON_MAX_ITERS; ++iter)
+        {
+            const float damping = fminf(gnorm * gnorm, 1e-3f);
+            hessian(values_T, c, damping, lane, shared_H[group]);
+            #pragma unroll
+            for (int j = 0; j < 7; ++j)
+                if (lane == j % 4) shared_rhs[group][j] = 1.0f - c[j];
+            __syncwarp(matrix_mask());
+            if (lane == 0) solve_linear_system<true>(shared_H[group], shared_rhs[group], shared_x[group]);
+            __syncwarp(matrix_mask());
+            Row direction, magnitude;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j)
+            {
+                direction[j] = j < 7 ? shared_x[group][j] : 0.0f;
+                magnitude[j] = fabsf(direction[j]);
+            }
+            const float direction_sum = row_sum(direction);
+            const float direction_max = row_max(magnitude);
+            bool accepted = false;
+            #pragma unroll 1
+            for (int k = 0; k < LINE_SEARCH_MAX_ITERS; ++k)
+            {
+                Row candidate_beta, step;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                {
+                    step[j] = gammas[k] * direction[j];
+                    // Match the existing separately rounded step and update.
+                    candidate_beta[j] = __fadd_rn(beta[j], step[j]);
+                }
+                const float candidate_sum = __fadd_rn(beta_sum, gammas[k] * direction_sum);
+                Matrix candidate_T;
+                float delta;
+                if (gammas[k] * direction_max < 0.5f)
+                    delta = relative_candidate(values_T, step, gammas[k] * direction_sum, candidate_T);
+                else
+                    delta = objective(values_R, candidate_beta, candidate_sum, candidate_T) - f;
+                if (!(delta < 0.0f)) continue;
+                Row candidate_c;
+                const float candidate_gnorm = gradient(candidate_T, candidate_c);
+                if (!(candidate_gnorm < gnorm)) continue;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j)
+                {
+                    beta[j] = candidate_beta[j];
+                    c[j] = candidate_c[j];
+                    values_T[0][j] = candidate_T[0][j];
+                    values_T[1][j] = candidate_T[1][j];
+                }
+                beta_sum = candidate_sum;
+                f += delta;
+                gnorm = candidate_gnorm;
+                accepted = true;
+                break;
+            }
+            if (!accepted)
+            {
+                sinkhorn(values_R, beta);
+                beta_sum = row_sum(beta);
+                f = objective(values_R, beta, beta_sum, values_T);
+                gnorm = gradient(values_T, c);
+            }
+            if (gnorm < tol) break;
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < 2; ++r)
+    {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+            T[instance * 64 + (lane + 4 * r) * 8 + j] = values_T[r][j];
+    }
+}
+} // namespace birkhoff_n8::quarterwarp
+
 void birkhoff_proj_n8(
     const float* R,
     float* T,
@@ -712,25 +1086,22 @@ void birkhoff_proj_n8(
     cudaStream_t stream
 )
 {
-    const int num_blocks =
-        (batch_size + birkhoff_n8::WARPS_PER_BLOCK - 1) /
-        birkhoff_n8::WARPS_PER_BLOCK;
-    if (batch_size >= birkhoff_n8::LDLT_MIN_BATCH_SIZE)
+    if (batch_size >= birkhoff_n8::LARGE_BATCH_MIN_SIZE)
     {
-        birkhoff_n8::birkhoff_proj_n8_kernel<true><<<
-            num_blocks,
-            birkhoff_n8::BLOCK_DIM,
-            0,
-            stream
+        const int num_blocks =
+            (batch_size + birkhoff_n8::quarterwarp::MATRICES_PER_BLOCK - 1) /
+            birkhoff_n8::quarterwarp::MATRICES_PER_BLOCK;
+        birkhoff_n8::quarterwarp::birkhoff_proj_n8_kernel<<<
+            num_blocks, birkhoff_n8::BLOCK_DIM, 0, stream
         >>>(R, T, tol, batch_size);
     }
     else
     {
+        const int num_blocks =
+            (batch_size + birkhoff_n8::WARPS_PER_BLOCK - 1) /
+            birkhoff_n8::WARPS_PER_BLOCK;
         birkhoff_n8::birkhoff_proj_n8_kernel<false><<<
-            num_blocks,
-            birkhoff_n8::BLOCK_DIM,
-            0,
-            stream
+            num_blocks, birkhoff_n8::BLOCK_DIM, 0, stream
         >>>(R, T, tol, batch_size);
     }
 }
@@ -743,13 +1114,22 @@ void birkhoff_proj_n8_backward(
     cudaStream_t stream
 )
 {
-    const int num_blocks =
-        (batch_size + birkhoff_n8::WARPS_PER_BLOCK - 1) /
-        birkhoff_n8::WARPS_PER_BLOCK;
-    birkhoff_n8::birkhoff_proj_n8_backward_kernel<<<
-        num_blocks,
-        birkhoff_n8::BLOCK_DIM,
-        0,
-        stream
-    >>>(G, T, D, batch_size);
+    if (batch_size >= birkhoff_n8::LARGE_BATCH_MIN_SIZE)
+    {
+        const int num_blocks =
+            (batch_size + birkhoff_n8::halfwarp::MATRICES_PER_BLOCK - 1) /
+            birkhoff_n8::halfwarp::MATRICES_PER_BLOCK;
+        birkhoff_n8::halfwarp::birkhoff_proj_n8_backward_kernel<<<
+            num_blocks, birkhoff_n8::BLOCK_DIM, 0, stream
+        >>>(G, T, D, batch_size);
+    }
+    else
+    {
+        const int num_blocks =
+            (batch_size + birkhoff_n8::WARPS_PER_BLOCK - 1) /
+            birkhoff_n8::WARPS_PER_BLOCK;
+        birkhoff_n8::birkhoff_proj_n8_backward_kernel<<<
+            num_blocks, birkhoff_n8::BLOCK_DIM, 0, stream
+        >>>(G, T, D, batch_size);
+    }
 }

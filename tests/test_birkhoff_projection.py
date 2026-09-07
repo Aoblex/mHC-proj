@@ -78,11 +78,11 @@ def test_projection_forward_backward(
 
 
 @pytest.mark.parametrize(("n", "module_type"), PROJECTION_MODULES)
-@pytest.mark.parametrize("batch_size", [128, 129, 32768])
+@pytest.mark.parametrize("batch_size", [128, 129, 32768, 32769])
 def test_projection_matches_float64_reference(
     n: int, module_type: type[torch.nn.Module], batch_size: int
 ) -> None:
-    """Exercise small-step convergence, partial warps, and both n8 schedules."""
+    """Exercise small-step convergence and partial groups in both n8 schedules."""
     torch.manual_seed(2026)
     logits = torch.randn(batch_size, n, n, device="cuda", requires_grad=True)
     upstream = torch.randn_like(logits)
