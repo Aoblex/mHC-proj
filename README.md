@@ -1,16 +1,16 @@
 # mHC-proj
 
-**mHC-proj** is a CUDA library that accelerates the Birkhoff projection operator in [manifold-constrained hyper-connections (mHC)](https://arxiv.org/pdf/2512.24880). The current implemention supports the expansion rate of $n=4$ in mHC, providing highly optimized CUDA kernels that output $4\times 4$ doubly stochastic matrices from unconstrained ones. Both forward and backward passes are supported. Details can be found in our paper [Accelerating Birkhoff Projection for Manifold-Constrained Hyper-Connections](https://arxiv.org/pdf/2606.07574).
+**mHC-proj** is a CUDA library that accelerates the Birkhoff projection operator in [manifold-constrained hyper-connections (mHC)](https://arxiv.org/pdf/2512.24880). The current implementation supports the expansion rates of $n=4$ and $n=8$ in mHC, providing highly optimized CUDA kernels that output $n\times n$ doubly stochastic matrices from unconstrained ones. Both forward and backward passes are supported. Details can be found in our paper [Accelerating Birkhoff Projection for Manifold-Constrained Hyper-Connections](https://arxiv.org/pdf/2606.07574).
 
 ## Method
 
 This library uses a different algorithm from the Sinkhorn-Knopp method that is suggested by the [mHC paper](https://arxiv.org/pdf/2512.24880). It has the following highlights:
 
-1. **Forward pass via Newton's method**: We reformulate the dual of the Birkhoff projection problem as an unconstrained convex optimization in $\mathbb{R}^{3}$, and derive closed-form expressions for the gradient and Hessian. This enables the use of Newton's method, which converges quadratically and typically requires far fewer iterations than Sinkhorn-Knopp.
+1. **Forward pass via Newton's method**: We reformulate the dual of the Birkhoff projection problem as an unconstrained convex optimization in $\mathbb{R}^{n-1}$ (three dimensions for $n=4$, seven for $n=8$), and derive closed-form expressions for the gradient and Hessian. This enables the use of Newton's method, which converges quadratically and typically requires far fewer iterations than Sinkhorn-Knopp.
 
 2. **Backward pass via implicit differentiation**: Instead of backpropagating through the iterative solver, we derive an analytical expression for the derivative of the projection using the implicit function theorem. This allows us to compute gradients exactly and efficiently, without storing intermediate iterates.
 
-3. **GPU-efficient implementation**: We design a warp-level CUDA kernel that processes two $4\times4$ matrices simultaneously using only register-level primitives. The implementation avoids shared memory and global memory I/O, achieving high throughput with minimal overhead.
+3. **GPU-efficient implementation**: For $n=4$, we design a warp-level CUDA kernel that processes two $4\times4$ matrices simultaneously using only register-level primitives, avoiding shared memory and intermediate global memory I/O. For $n=8$, we use separate small- and large-batch schedules, with shared memory used in some paths.
 
 ## Installation
 
@@ -22,7 +22,7 @@ pip3 install --no-build-isolation .
 
 ## PyTorch Interface
 
-The projection operator can be accessed via the `mhc_proj.MHCProjectionN4` module:
+The projection operator can be accessed via the `mhc_proj.MHCProjectionN4` module. For $n=8$, use `mhc_proj.MHCProjectionN8` with input matrices of size $8\times8$; the interface is otherwise the same:
 
 ```py
 import torch
