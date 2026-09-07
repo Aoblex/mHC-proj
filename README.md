@@ -137,7 +137,7 @@ print(D3)
 
 We benchmark the following open-source implementations on an Nvidia RTX 6000 Ada GPU:
 
-1. **Vanilla**: A simple implementation of the Sinkhorn–Knopp algorithm using pure PyTorch code.
+1. **Vanilla**: A simple implementation of the Sinkhorn–Knopp algorithm using pure PyTorch code, executed with `torch.compile`.
 2. **Triton-Sinkhorn**: A CUDA-fused implementation of the Sinkhorn–Knopp algorithm backed by OpenAI Triton: https://github.com/LottoLottoLotto/triton-sinkhorn.
 3. **mHC.cu**: A CUDA implementation of mHC, with specialized optimizations for $n=4$: https://github.com/AndreSlavescu/mHC.cu.
 4. **TileLangExamples**: A [TileLang](https://github.com/tile-ai/tilelang) implementation of the Sinkhorn-Knopp algorithm adapted from the TileLang examples, with a backward pass using implicit conjugate gradient: https://github.com/tile-ai/tilelang/tree/main/examples/deepseek_mhc.
@@ -145,26 +145,80 @@ We benchmark the following open-source implementations on an Nvidia RTX 6000 Ada
 6. **mHC-proj-TL**: A TileLang implementation of the proposed second-order Birkhoff projection solver: https://github.com/yixuan/mHC-proj/tree/master/benchmark/mhc/tilelang.
 7. **mHC-proj**: This library.
 
-The test code can be found in the [benchmark](benchmark) directory.
+The test code can be found in the [benchmark](benchmark) directory. For $n=8$, we use the adaptations included in this repository. In the $n=8$ tables, the CUDA Sinkhorn backend is labeled **CUDA-Sinkhorn** rather than mHC.cu, whose upstream implementation specializes in $n=4$.
 
 ### Accuracy
 
-We randomly generate $N=10000$ matrices of size $4\times 4$, forming an $N\times 4\times 4$ tensor $R$ as the input of the seven implementations. Each of them outputs a tensor $T$ consisting of $N$ matrices of size $4\times 4$. If the projection is accurate, then each $T_i$ is doubly stochastic, so we measure the error as
+For each $n\in\{4,8\}$, we randomly generate $N=10000$ FP32 matrices of size $n\times n$ with seed 123, forming an $N\times n\times n$ tensor $R$ as the input of the seven implementations. Each outputs a tensor $T$ of the same shape. If the projection is accurate, then each $T_i$ is doubly stochastic, so we measure the error in FP64 as
 
 $$
-\mathrm{Err}(T_i)=\Vert T_i\mathbf{1}_4-\mathbf{1}_4 \Vert_1 + \Vert T_i^\top\mathbf{1}_4-\mathbf{1}_4 \Vert_1.
+\mathrm{Err}(T_i)=\Vert T_i\mathbf{1}_n-\mathbf{1}_n \Vert_1 + \Vert T_i^\top\mathbf{1}_n-\mathbf{1}_n \Vert_1.
 $$
 
-The mean, standard deviation, median, and maximum of the $N$ error values are summarized below:
+The mean, sample standard deviation, median, and maximum of the $N$ error values are shown below. Lowest displayed values within each distribution and statistic are highlighted in green. These statistics measure forward marginal error, not gradient accuracy.
 
-![](benchmark/table1.png)
+#### n=4
+
+![n=4 marginal errors, scale 1](assets/sm89-n4-accuracy-scale1.png)
 
 If the magnitudes of the entries are larger, then mHC-proj demonstrates larger advantages:
 
-![](benchmark/table2.png)
+![n=4 marginal errors, scale 10](assets/sm89-n4-accuracy-scale10.png)
+
+#### n=8
+
+The same distributions and statistics are used for $n=8$.
+
+![n=8 marginal errors, scale 1](assets/sm89-n8-accuracy-scale1.png)
+
+![n=8 marginal errors, scale 10](assets/sm89-n8-accuracy-scale10.png)
 
 ### Run time
 
-We fix the input distribution to be $N(0,10^2)$, reuse the original input on every call, and measure the run time of different implementations for various batch sizes $N$. The time is normalized such that in each configuration **mHC-proj** has one unit of run time.
+The runtime tables below use inputs from $N(0,10^2)$. We reuse the original input on every call and measure the run time of different implementations for various batch sizes $N$. The time is normalized such that in each configuration **mHC-proj** has one unit of run time.
 
-![](benchmark/table3.png)
+The harness uses eager calls and CUDA Event timing: 100 warmup calls, 100 calls per sample, and 10 rounds. Reported values are medians of per-round ratios. Backends use their configured methods, so this is not an accuracy-matched comparison.
+
+#### n=4
+
+![n=4 normalized runtime, scale 10](assets/sm89-n4-runtime-scale10.png)
+
+#### n=8
+
+![n=8 normalized runtime, scale 10](assets/sm89-n8-runtime-scale10.png)
+
+### Recording and plotting results
+
+Measure both matrix sizes and input scales on GPU 0:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 make benchmark ARGS="--n 4 8 --scale 1 10"
+```
+
+Each configuration gets a directory under `benchmark/results/`, which is ignored by Git. For example, on sm89:
+
+```text
+benchmark/results/sm89-n4-scale1/
+├── config.json
+├── accuracy.csv
+├── runtime.csv
+├── accuracy.png
+└── runtime.png
+```
+
+`config.json` records the parameters, seed, code revision, timestamps and environment. `accuracy.csv` records each matrix's marginal error for normal and uniform inputs. `runtime.csv` records each round's average per-call latency for every backend, batch size and mode. A scale of $s$ multiplies standard-normal or $U(-1,1)$ inputs by $s$; runtime measurements use the normal distribution. Both scale 1 and scale 10 record accuracy and runtime. Replacing an existing measurement requires an explicit `--overwrite`.
+
+Generate the PNG files from the saved data, without running CUDA workloads:
+
+```bash
+uv run --no-sync --group benchmark python benchmark/plot.py benchmark/results/sm89-n*-scale*
+```
+
+The plotting script computes statistics and median per-round runtime ratios from the CSV files. To also copy selected figures into the root `assets/` directory for the README:
+
+```bash
+uv run --no-sync --group benchmark python benchmark/plot.py benchmark/results/sm89-n*-scale1 --publish accuracy
+uv run --no-sync --group benchmark python benchmark/plot.py benchmark/results/sm89-n*-scale10 --publish accuracy runtime
+```
+
+`assets/` contains the published PNG files, named by architecture, matrix size, metric and scale, such as `sm89-n8-runtime-scale10.png`.

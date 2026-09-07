@@ -5,6 +5,7 @@ build/*
 
 .codex
 .agents/runs/
+benchmark/results/
 *.egg-info
 .vscode/
 references/
