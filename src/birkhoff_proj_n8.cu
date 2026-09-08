@@ -14,8 +14,8 @@ constexpr int BLOCK_DIM = 128;
 constexpr int WARPS_PER_BLOCK = BLOCK_DIM / 32;
 constexpr int NEWTON_MAX_ITERS = 20;
 constexpr int LINE_SEARCH_MAX_ITERS = 5;
-// Keep the original small-batch Cholesky schedule. Saturated batches use
-// row-owned forward with packed LDL^T; half-warp backward remains Cholesky.
+// All schedules use Cholesky. Saturated batches use row-owned forward
+// and half-warp backward; small batches retain one warp per matrix.
 constexpr int LARGE_BATCH_MIN_SIZE = 32768;
 constexpr float EPSILON = 1e-8f;
 constexpr unsigned int FULL_MASK = 0xffffffffu;
@@ -330,123 +330,6 @@ __device__ __forceinline__ bool cholesky_solve(
     return true;
 }
 
-// Lane 0 solves Hx=rhs using a packed, register-resident LDL^T factor.
-// L has an implicit unit diagonal and stores only its 21 strict-lower entries.
-// Returning false lets forward fall back to the gradient direction when a
-// finite-precision pivot is invalid.
-__device__ __forceinline__ bool ldlt_solve(
-    const float* H,
-    const float* rhs,
-    float* x
-)
-{
-    float L[REDUCED_SIZE * (REDUCED_SIZE - 1) / 2];
-    float D[REDUCED_SIZE];
-    float work[REDUCED_SIZE];
-
-    #pragma unroll
-    for (int k = 0; k < REDUCED_SIZE; ++k)
-    {
-        const int base_k = k * (k - 1) / 2;
-        float diagonal = H[k * REDUCED_SIZE + k];
-        #pragma unroll
-        for (int r = 0; r < k; ++r)
-        {
-            const float lkr = L[base_k + r];
-            diagonal -= lkr * lkr * D[r];
-        }
-        if (!(diagonal > EPSILON) || !isfinite(diagonal))
-        {
-            #pragma unroll
-            for (int i = 0; i < REDUCED_SIZE; ++i)
-            {
-                x[i] = rhs[i];
-            }
-            return false;
-        }
-        D[k] = diagonal;
-
-        #pragma unroll
-        for (int i = k + 1; i < REDUCED_SIZE; ++i)
-        {
-            const int base_i = i * (i - 1) / 2;
-            float value = H[i * REDUCED_SIZE + k];
-            #pragma unroll
-            for (int r = 0; r < k; ++r)
-            {
-                value -= L[base_i + r] * D[r] * L[base_k + r];
-            }
-            value /= diagonal;
-            if (!isfinite(value))
-            {
-                #pragma unroll
-                for (int j = 0; j < REDUCED_SIZE; ++j)
-                {
-                    x[j] = rhs[j];
-                }
-                return false;
-            }
-            L[base_i + k] = value;
-        }
-    }
-
-    #pragma unroll
-    for (int i = 0; i < REDUCED_SIZE; ++i)
-    {
-        const int base_i = i * (i - 1) / 2;
-        float value = rhs[i];
-        #pragma unroll
-        for (int j = 0; j < i; ++j)
-        {
-            value -= L[base_i + j] * work[j];
-        }
-        work[i] = value;
-    }
-
-    #pragma unroll
-    for (int i = 0; i < REDUCED_SIZE; ++i)
-    {
-        work[i] /= D[i];
-    }
-
-    #pragma unroll
-    for (int i = REDUCED_SIZE - 1; i >= 0; --i)
-    {
-        float value = work[i];
-        #pragma unroll
-        for (int j = i + 1; j < REDUCED_SIZE; ++j)
-        {
-            value -= L[j * (j - 1) / 2 + i] * work[j];
-        }
-        work[i] = value;
-    }
-
-    #pragma unroll
-    for (int i = 0; i < REDUCED_SIZE; ++i)
-    {
-        x[i] = work[i];
-    }
-    return true;
-}
-
-template<bool USE_LDLT>
-__device__ __forceinline__ void solve_linear_system(
-    float* H,
-    const float* rhs,
-    float* x
-)
-{
-    if constexpr (USE_LDLT)
-    {
-        ldlt_solve(H, rhs, x);
-    }
-    else
-    {
-        cholesky_solve(H, rhs, x);
-    }
-}
-
-template<bool USE_LDLT>
 __global__ void birkhoff_proj_n8_kernel(
     const float* __restrict__ R,
     float* __restrict__ T,
@@ -527,7 +410,7 @@ __global__ void birkhoff_proj_n8_kernel(
 
             if (lane_id == 0)
             {
-                solve_linear_system<USE_LDLT>(
+                cholesky_solve(
                     shared_H[warp_id],
                     shared_rhs[warp_id],
                     shared_x[warp_id]
@@ -1010,7 +893,7 @@ __global__ void birkhoff_proj_n8_kernel(
             for (int j = 0; j < 7; ++j)
                 if (lane == j % 4) shared_rhs[group][j] = 1.0f - c[j];
             __syncwarp(matrix_mask());
-            if (lane == 0) solve_linear_system<true>(shared_H[group], shared_rhs[group], shared_x[group]);
+            if (lane == 0) cholesky_solve(shared_H[group], shared_rhs[group], shared_x[group]);
             __syncwarp(matrix_mask());
             Row direction, magnitude;
             #pragma unroll
@@ -1100,7 +983,7 @@ void birkhoff_proj_n8(
         const int num_blocks =
             (batch_size + birkhoff_n8::WARPS_PER_BLOCK - 1) /
             birkhoff_n8::WARPS_PER_BLOCK;
-        birkhoff_n8::birkhoff_proj_n8_kernel<false><<<
+        birkhoff_n8::birkhoff_proj_n8_kernel<<<
             num_blocks, birkhoff_n8::BLOCK_DIM, 0, stream
         >>>(R, T, tol, batch_size);
     }

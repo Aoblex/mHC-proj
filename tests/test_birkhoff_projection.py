@@ -123,6 +123,15 @@ def test_projection_matches_float64_reference(
     assert error.max() < 3e-6
 
 
+def test_n8_partial_large_batch_marginal_accuracy() -> None:
+    """Cover the accepted FP32 rounding variation in the four-thread solver."""
+    torch.manual_seed(123)
+    logits = torch.randn(65537, 8, 8, device="cuda")
+    output = mhc_proj.MHCProjectionN8(tol=1e-6)(logits).double()
+    error = (output.sum(-1) - 1).abs().sum(-1) + (output.sum(-2) - 1).abs().sum(-1)
+    assert error.max() < 3.2e-6
+
+
 @pytest.mark.parametrize("batch_size", [2048, 32768])
 def test_n8_small_step_convergence_on_difficult_inputs(batch_size: int) -> None:
     """Small valid steps must not be lost to absolute-objective rounding."""
